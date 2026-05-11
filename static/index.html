@@ -47,9 +47,12 @@
                 </form>
 
                 <div class="mt-8 pt-8 border-t border-slate-200">
-                    <p class="text-xs text-slate-500">
+                    <p class="text-xs text-slate-500 mb-4">
                         💡 <strong>How it works:</strong> Paste your landing page URL above. Our AI will analyze the content and generate a prioritized list of high-impact A/B experiments using the ICE framework (Impact, Confidence, Ease).
                     </p>
+                    <div id="usage-indicator" class="p-3 bg-blue-50 rounded-lg border border-blue-200">
+                        <p class="text-xs text-slate-600"><strong>Demo Usage:</strong> <span id="usage-text">Loading...</span></p>
+                    </div>
                 </div>
             </div>
 
@@ -76,7 +79,10 @@
                 <!-- Header -->
                 <div class="bg-gradient-to-r from-blue-600 to-blue-700 p-8 text-white">
                     <h2 class="text-3xl font-bold mb-2">Your Growth Roadmap</h2>
-                    <p class="text-blue-100" id="page-title"></p>
+                    <p class="text-blue-100 mb-3" id="page-title"></p>
+                    <div class="text-xs text-blue-100 bg-blue-500 bg-opacity-30 px-3 py-2 rounded inline-block">
+                        <span id="results-usage">Demo usage: calculating...</span>
+                    </div>
                 </div>
 
                 <!-- Tabs -->
@@ -169,6 +175,20 @@
             error: document.getElementById('screen-error')
         };
 
+        // Load usage stats on page load
+        async function loadUsageStats() {
+            try {
+                const response = await fetch('/api/stats');
+                const data = await response.json();
+                const usageText = `${data.daily_used}/${data.daily_limit} daily analyses used (${data.daily_remaining} remaining) • ${data.hourly_used}/${data.hourly_limit} this hour`;
+                document.getElementById('usage-text').textContent = usageText;
+            } catch (error) {
+                console.log('Could not load usage stats');
+            }
+        }
+
+        window.addEventListener('load', loadUsageStats);
+
         function showScreen(screenName) {
             Object.values(screens).forEach(screen => screen.classList.add('hidden'));
             screens[screenName].classList.remove('hidden');
@@ -212,8 +232,22 @@
                 });
 
                 if (!response.ok) {
-                    const error = await response.json();
-                    throw new Error(error.detail || 'Analysis failed');
+                    const errorData = await response.json();
+                    let errorMessage = 'Analysis failed';
+
+                    // Handle rate limit errors
+                    if (response.status === 429 && errorData.detail && typeof errorData.detail === 'object') {
+                        errorMessage = errorData.detail.message || errorMessage;
+                        if (errorData.detail.reason === 'daily_limit_reached') {
+                            errorMessage = `📊 Daily Limit Reached\n\nThis is a demonstration tool with limited free usage to protect the API infrastructure.\n\n${errorData.detail.message}\n\nThank you for understanding!`;
+                        } else if (errorData.detail.reason === 'hourly_limit_reached') {
+                            errorMessage = `⏱️ Hourly Limit Reached\n\nThis is a demonstration tool with limited free usage to protect the API infrastructure.\n\n${errorData.detail.message}\n\nThank you for understanding!`;
+                        }
+                    } else if (typeof errorData.detail === 'string') {
+                        errorMessage = errorData.detail;
+                    }
+
+                    throw new Error(errorMessage);
                 }
 
                 const data = await response.json();
@@ -229,6 +263,12 @@
         function displayResults(data) {
             // Page title
             document.getElementById('page-title').textContent = data.page_description;
+
+            // Usage stats
+            if (data.usage) {
+                const usageText = `${data.usage.daily_used}/${data.usage.daily_limit} daily (${data.usage.daily_remaining} left) • ${data.usage.hourly_used}/${data.usage.hourly_limit} this hour`;
+                document.getElementById('results-usage').textContent = usageText;
+            }
 
             // Experiments
             const experimentsList = document.getElementById('experiments-list');

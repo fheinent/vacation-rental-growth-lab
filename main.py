@@ -1,6 +1,9 @@
 import os
 import re
-from fastapi import FastAPI, HTTPException
+import json
+import time
+from datetime import datetime, timedelta
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -11,6 +14,85 @@ from anthropic import Anthropic
 app = FastAPI()
 client = Anthropic()
 
+# Rate limiting config
+REQUESTS_PER_HOUR_PER_IP = 5
+REQUESTS_PER_DAY_TOTAL = 50
+LIMITS_FILE = "usage_limits.json"
+
+def load_usage():
+    """Load usage data from file."""
+    if os.path.exists(LIMITS_FILE):
+        try:
+            with open(LIMITS_FILE, "r") as f:
+                return json.load(f)
+        except:
+            return {"daily_total": 0, "last_reset": datetime.now().isoformat(), "ips": {}}
+    return {"daily_total": 0, "last_reset": datetime.now().isoformat(), "ips": {}}
+
+def save_usage(data):
+    """Save usage data to file."""
+    with open(LIMITS_FILE, "w") as f:
+        json.dump(data, f)
+
+def check_and_increment_limits(client_ip: str) -> dict:
+    """Check rate limits and increment counters. Returns status dict."""
+    usage = load_usage()
+    now = datetime.now()
+    last_reset = datetime.fromisoformat(usage["last_reset"])
+
+    # Reset daily counter if 24 hours have passed
+    if (now - last_reset).total_seconds() > 86400:
+        usage["daily_total"] = 0
+        usage["ips"] = {}
+        usage["last_reset"] = now.isoformat()
+
+    # Check daily limit
+    if usage["daily_total"] >= REQUESTS_PER_DAY_TOTAL:
+        return {
+            "allowed": False,
+            "reason": "daily_limit_reached",
+            "message": f"Daily limit of {REQUESTS_PER_DAY_TOTAL} analyses reached. Please try again tomorrow.",
+            "daily_used": usage["daily_total"],
+            "daily_limit": REQUESTS_PER_DAY_TOTAL
+        }
+
+    # Check IP hourly limit
+    ip_data = usage["ips"].get(client_ip, {"requests": [], "count": 0})
+    now_timestamp = time.time()
+    hour_ago = now_timestamp - 3600
+
+    # Clean old requests
+    ip_data["requests"] = [ts for ts in ip_data["requests"] if ts > hour_ago]
+
+    if len(ip_data["requests"]) >= REQUESTS_PER_HOUR_PER_IP:
+        oldest_request = min(ip_data["requests"])
+        reset_time = datetime.fromtimestamp(oldest_request + 3600).strftime("%H:%M")
+        return {
+            "allowed": False,
+            "reason": "hourly_limit_reached",
+            "message": f"Hourly limit of {REQUESTS_PER_HOUR_PER_IP} analyses reached. Your limit resets at {reset_time} UTC.",
+            "hourly_used": len(ip_data["requests"]),
+            "hourly_limit": REQUESTS_PER_HOUR_PER_IP,
+            "reset_time": reset_time
+        }
+
+    # Increment counters
+    ip_data["requests"].append(now_timestamp)
+    ip_data["count"] = len(ip_data["requests"])
+    usage["ips"][client_ip] = ip_data
+    usage["daily_total"] += 1
+    save_usage(usage)
+
+    return {
+        "allowed": True,
+        "hourly_used": len(ip_data["requests"]),
+        "hourly_limit": REQUESTS_PER_HOUR_PER_IP,
+        "hourly_remaining": REQUESTS_PER_HOUR_PER_IP - len(ip_data["requests"]),
+        "daily_used": usage["daily_total"],
+        "daily_limit": REQUESTS_PER_DAY_TOTAL,
+        "daily_remaining": REQUESTS_PER_DAY_TOTAL - usage["daily_total"]
+    }
+
 class AnalysisRequest(BaseModel):
     url: str
 
@@ -20,6 +102,7 @@ class AnalysisResponse(BaseModel):
     champion_brief: str
     page_title: str
     page_description: str
+    usage: dict = None
 
 def clean_html(html: str) -> str:
     """Remove scripts, styles, and extra whitespace."""
@@ -89,8 +172,27 @@ def parse_quick_wins(response_text: str) -> list:
     return [w for w in quick_wins if w][:4]
 
 @app.post("/api/analyze")
-async def analyze(request: AnalysisRequest) -> AnalysisResponse:
+async def analyze(request: AnalysisRequest, http_request: Request) -> AnalysisResponse:
     """Analyze a vacation rental landing page for A/B experiment opportunities."""
+
+    # Get client IP
+    client_ip = http_request.client.host
+
+    # Check rate limits
+    limit_check = check_and_increment_limits(client_ip)
+
+    if not limit_check["allowed"]:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error": limit_check["reason"],
+                "message": limit_check["message"],
+                "daily_used": limit_check.get("daily_used", 0),
+                "daily_limit": limit_check.get("daily_limit", 0),
+                "hourly_used": limit_check.get("hourly_used", 0),
+                "hourly_limit": limit_check.get("hourly_limit", 0)
+            }
+        )
 
     # Validate URL
     if not request.url.startswith(("http://", "https://")):
@@ -167,11 +269,50 @@ Then add "Champion Brief" section with 2-3 sentences on how a Growth Champion wo
             quick_wins=quick_wins,
             champion_brief=champion_brief,
             page_title=request.url.split("/")[-1] or "Landing Page",
-            page_description=f"Analysis of {request.url[:50]}..."
+            page_description=f"Analysis of {request.url[:50]}...",
+            usage={
+                "hourly_used": limit_check.get("hourly_used", 0),
+                "hourly_limit": limit_check.get("hourly_limit", 0),
+                "hourly_remaining": limit_check.get("hourly_remaining", 0),
+                "daily_used": limit_check.get("daily_used", 0),
+                "daily_limit": limit_check.get("daily_limit", 0),
+                "daily_remaining": limit_check.get("daily_remaining", 0)
+            }
         )
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
+
+@app.get("/api/stats")
+async def get_stats(http_request: Request):
+    """Get usage stats for current IP."""
+    client_ip = http_request.client.host
+    usage = load_usage()
+    ip_data = usage["ips"].get(client_ip, {"requests": [], "count": 0})
+
+    now_timestamp = time.time()
+    hour_ago = now_timestamp - 3600
+    recent_requests = [ts for ts in ip_data["requests"] if ts > hour_ago]
+
+    return {
+        "hourly_used": len(recent_requests),
+        "hourly_limit": REQUESTS_PER_HOUR_PER_IP,
+        "hourly_remaining": max(0, REQUESTS_PER_HOUR_PER_IP - len(recent_requests)),
+        "daily_used": usage["daily_total"],
+        "daily_limit": REQUESTS_PER_DAY_TOTAL,
+        "daily_remaining": max(0, REQUESTS_PER_DAY_TOTAL - usage["daily_total"]),
+        "client_ip": client_ip,
+        "message": "This is a demo tool with limited free usage. For production use, contact the developer."
+    }
+
+@app.get("/api/limits")
+async def get_limits():
+    """Get rate limit configuration."""
+    return {
+        "requests_per_hour_per_ip": REQUESTS_PER_HOUR_PER_IP,
+        "requests_per_day_total": REQUESTS_PER_DAY_TOTAL,
+        "message": "This is a demonstration tool with limited free usage to protect the API infrastructure. Thank you for understanding!"
+    }
 
 @app.get("/")
 async def root():
