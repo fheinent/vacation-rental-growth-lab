@@ -17,7 +17,7 @@ client = Anthropic()
 # Rate limiting config
 REQUESTS_PER_HOUR_PER_IP = 5
 REQUESTS_PER_DAY_TOTAL = 50
-LIMITS_FILE = "usage_limits.json"
+LIMITS_FILE = os.path.join(os.getenv("TMPDIR", "/tmp"), "usage_limits.json")
 
 def load_usage():
     """Load usage data from file."""
